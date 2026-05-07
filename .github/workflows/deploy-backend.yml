@@ -1,0 +1,71 @@
+name: Deploy Backend
+
+on:
+  push:
+    branches:
+      - main
+      - feature/full-stack
+    paths:
+      - 'Server/**'   # backend only
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Build and deploy Go API
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache-dependency-path: Server/MuchToDo/go.sum
+
+      - name: Build Go binary
+        working-directory: Server/MuchToDo
+        run: |
+          GOOS=linux GOARCH=amd64 go build -o much-to-do-server ./cmd/api/
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Deploy to EC2 instances via SSM
+        run: |
+          for INSTANCE_ID in ${{ secrets.EC2_INSTANCE_1_ID }} ${{ secrets.EC2_INSTANCE_2_ID }}; do
+            echo "Deploying to $INSTANCE_ID..."
+
+            # Upload binary to S3 first
+            aws s3 cp Server/MuchToDo/much-to-do-server \
+              s3://${{ secrets.S3_BUCKET_NAME }}/backend/much-to-do-server
+
+            # Use SSM to pull binary from S3 and restart service
+            aws ssm send-command \
+              --instance-ids "$INSTANCE_ID" \
+              --document-name "AWS-RunShellScript" \
+              --parameters commands='[
+                "aws s3 cp s3://${{ secrets.S3_BUCKET_NAME }}/backend/much-to-do-server /opt/much-to-do/much-to-do-server-new",
+                "chmod +x /opt/much-to-do/much-to-do-server-new",
+                "systemctl stop much-to-do",
+                "mv /opt/much-to-do/much-to-do-server-new /opt/much-to-do/much-to-do-server",
+                "systemctl start much-to-do",
+                "systemctl status much-to-do"
+              ]' \
+              --timeout-seconds 300 \
+              --region ${{ secrets.AWS_REGION }}
+
+            echo "Deployed to $INSTANCE_ID successfully"
+          done
+
+      - name: Verify deployment
+        run: |
+          echo "Waiting 15 seconds for service to start..."
+          sleep 15
+          echo "Checking ALB health..."
+          curl -f http://${{ secrets.ALB_DNS_NAME }}/ping && echo "Backend is healthy" || echo "Health check failed"
